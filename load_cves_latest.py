@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 Download/load CVEProject/cvelistV5 release ZIPs into a SQL database.
@@ -33,6 +34,8 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
+import time
 import urllib.parse
 import urllib.request
 import zipfile
@@ -41,6 +44,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from dotenv import find_dotenv, load_dotenv
+import psutil
 
 
 GITHUB_RELEASES_API = "https://api.github.com/repos/CVEProject/cvelistV5/releases"
@@ -51,6 +55,101 @@ DELTA_ASSET_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}_delta_CVEs_at_\d{4}Z\.zip(?:\.zip)?$"
 )
 USER_AGENT = "cvelistV5-sql-loader/1.0"
+
+
+class ProcessMetrics:
+    """Track lightweight process-level performance metrics for one loader run."""
+
+    def __init__(self, sample_interval: float = 0.5) -> None:
+        self.sample_interval = sample_interval
+        self.process = psutil.Process(os.getpid())
+        self.started_at = 0.0
+        self.start_cpu_user = 0.0
+        self.start_cpu_system = 0.0
+        self.cpu_samples: list[float] = []
+        self.peak_rss = 0
+        self.phases: dict[str, float] = {}
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        cpu_times = self.process.cpu_times()
+        self.start_cpu_user = cpu_times.user
+        self.start_cpu_system = cpu_times.system
+        self.started_at = time.perf_counter()
+        self.peak_rss = self.process.memory_info().rss
+
+        # Prime psutil's non-blocking CPU percentage calculation.
+        self.process.cpu_percent(interval=None)
+        self._thread = threading.Thread(
+            target=self._sample_loop,
+            name="process-metrics",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _sample_loop(self) -> None:
+        while not self._stop_event.wait(self.sample_interval):
+            try:
+                self.cpu_samples.append(self.process.cpu_percent(interval=None))
+                self.peak_rss = max(self.peak_rss, self.process.memory_info().rss)
+            except (psutil.Error, OSError):
+                # Metrics should never cause an ingestion run to fail.
+                return
+
+    def record_phase(self, name: str, elapsed_seconds: float) -> None:
+        self.phases[name] = elapsed_seconds
+
+    def stop_and_report(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self.sample_interval + 0.5)
+
+        elapsed = max(0.0, time.perf_counter() - self.started_at)
+        try:
+            cpu_times = self.process.cpu_times()
+            cpu_user = max(0.0, cpu_times.user - self.start_cpu_user)
+            cpu_system = max(0.0, cpu_times.system - self.start_cpu_system)
+            cpu_total = cpu_user + cpu_system
+            self.peak_rss = max(self.peak_rss, self.process.memory_info().rss)
+        except (psutil.Error, OSError):
+            cpu_user = cpu_system = cpu_total = 0.0
+
+        sampled_avg = (
+            sum(self.cpu_samples) / len(self.cpu_samples)
+            if self.cpu_samples
+            else 0.0
+        )
+        sampled_peak = max(self.cpu_samples, default=0.0)
+
+        # This ratio is a useful whole-run CPU saturation metric. 100% means
+        # approximately one logical CPU was busy for the entire wall-clock run.
+        effective_cpu = (cpu_total / elapsed * 100.0) if elapsed > 0 else 0.0
+
+        print("\nPerformance summary")
+        print("-------------------")
+        print(f"Total elapsed time:      {format_duration(elapsed)}")
+        for phase, seconds in self.phases.items():
+            print(f"{phase + ':':24} {format_duration(seconds)}")
+        print(f"Process CPU time:        {format_duration(cpu_total)}")
+        print(f"  user:                  {format_duration(cpu_user)}")
+        print(f"  system:                {format_duration(cpu_system)}")
+        print(f"Effective CPU usage:     {effective_cpu:,.1f}%")
+        print(f"Average sampled CPU:     {sampled_avg:,.1f}%")
+        print(f"Peak sampled CPU:        {sampled_peak:,.1f}%")
+        print(f"Peak process memory:     {self.peak_rss / 1024 / 1024:,.1f} MiB")
+
+
+def format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:,.2f}s"
+
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{int(minutes)}m {sec:05.2f}s"
+
+    hours, minutes = divmod(int(minutes), 60)
+    return f"{hours}h {minutes:02d}m {sec:05.2f}s"
 
 from sqlalchemy import (
     JSON,
@@ -592,7 +691,7 @@ def load_zip(zip_path: Path, engine: Engine, batch_size: int) -> tuple[int, int]
     return processed, skipped
 
 
-def main() -> int:
+def run_loader(metrics: ProcessMetrics) -> int:
     # Load .env before reading any connection strings or secrets. Search from
     # the current working directory so project-local .env files work even when
     # this script is invoked by absolute path. Existing process environment
@@ -643,18 +742,41 @@ def main() -> int:
         )
 
     engine = build_engine(database_url)
-    verify_database_connection(engine)
-
     temp_dir = None
     try:
+        phase_start = time.perf_counter()
+        verify_database_connection(engine)
+        metrics.record_phase(
+            "Database connection", time.perf_counter() - phase_start
+        )
+
+        phase_start = time.perf_counter()
         zip_path, temp_dir = obtain_zip(args.zip_source, args.release_type)
+        metrics.record_phase(
+            "Download/archive prep", time.perf_counter() - phase_start
+        )
+
+        phase_start = time.perf_counter()
         loaded, skipped = load_zip(zip_path, engine, args.batch_size)
+        metrics.record_phase("CVE database load", time.perf_counter() - phase_start)
+
         print(f"Done. Upserted {loaded:,} CVEs; skipped {skipped:,} records.")
         return 0
     finally:
         if temp_dir is not None:
             temp_dir.cleanup()
+        engine.dispose()
+
+
+def main() -> int:
+    metrics = ProcessMetrics()
+    metrics.start()
+    try:
+        return run_loader(metrics)
+    finally:
+        metrics.stop_and_report()
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
