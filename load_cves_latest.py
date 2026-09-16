@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 Download/load CVEProject/cvelistV5 release ZIPs into a SQL database.
@@ -7,24 +6,22 @@ By default this script discovers the newest full daily baseline ZIP from the
 official GitHub Releases API, downloads it to a temporary directory, streams
 CVE JSON records from the ZIP, and upserts them into SQL.
 
+Configuration:
+    Connection strings and secrets are loaded from a .env file.
+
+    Required/optional .env variables:
+        DATABASE_URL=postgresql+psycopg://USER:PASSWORD@HOST/DB?sslmode=require
+        GITHUB_TOKEN=             # optional; raises GitHub API rate limits
+
 Examples:
     # Fresh database: download newest full baseline automatically.
-    python load_cves_latest.py --database-url sqlite:///cves.db
-
-    # PostgreSQL fresh load.
-    python load_cves_latest.py \
-        --database-url postgresql+psycopg://user:pass@localhost/cves
+    python load_cves_latest.py
 
     # Apply the newest hourly delta to an already-bootstrapped database.
-    python load_cves_latest.py --release-type delta \
-        --database-url postgresql+psycopg://user:pass@localhost/cves
+    python load_cves_latest.py --release-type delta
 
-    # Backward compatible: load a local file or direct ZIP URL.
-    python load_cves_latest.py ./2026-09-16_all_CVEs_at_midnight.zip \
-        --database-url sqlite:///cves.db
-
-Set GITHUB_TOKEN in the environment if you want authenticated GitHub API
-requests (useful for higher API rate limits).
+    # Load a local file or direct ZIP URL.
+    python load_cves_latest.py ./2026-09-16_all_CVEs_at_midnight.zip
 """
 
 from __future__ import annotations
@@ -43,10 +40,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+from dotenv import find_dotenv, load_dotenv
+
 
 GITHUB_RELEASES_API = "https://api.github.com/repos/CVEProject/cvelistV5/releases"
-BASELINE_ASSET_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_all_CVEs_at_midnight\.zip$")
-DELTA_ASSET_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_delta_CVEs_at_\d{4}Z\.zip$")
+BASELINE_ASSET_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}_all_CVEs_at_midnight\.zip(?:\.zip)?$"
+)
+DELTA_ASSET_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}_delta_CVEs_at_\d{4}Z\.zip(?:\.zip)?$"
+)
 USER_AGENT = "cvelistV5-sql-loader/1.0"
 
 from sqlalchemy import (
@@ -56,7 +59,9 @@ from sqlalchemy import (
     String,
     Text,
     create_engine,
+    text,
 )
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 
@@ -274,6 +279,80 @@ def is_cve_member(name: str) -> bool:
     return base.startswith("CVE-") and base.endswith(".json")
 
 
+def archive_contains_cves(zip_path: Path) -> bool:
+    """Return True when a ZIP directly contains CVE JSON records."""
+    with zipfile.ZipFile(zip_path) as archive:
+        return any(
+            not member.is_dir() and is_cve_member(member.filename)
+            for member in archive.infolist()
+        )
+
+
+def prepare_cve_zip(
+    zip_path: Path,
+    temp_dir: tempfile.TemporaryDirectory[str] | None = None,
+) -> tuple[Path, tempfile.TemporaryDirectory[str] | None]:
+    """Resolve GitHub's occasionally nested baseline artifact ZIP.
+
+    cvelistV5's baseline workflow uploads ``cves.zip`` as a GitHub Actions
+    artifact. GitHub wraps artifacts in another ZIP archive, and the current
+    release workflow can publish that wrapper with a ``.zip.zip`` name. In
+    that case the downloaded release asset contains ``cves.zip`` rather than
+    CVE JSON files directly.
+
+    This function unwraps nested ZIPs to disk (not memory) until the archive
+    directly contains CVE JSON records.
+    """
+    current = zip_path
+
+    for depth in range(3):
+        if archive_contains_cves(current):
+            return current, temp_dir
+
+        with zipfile.ZipFile(current) as archive:
+            nested = [
+                member
+                for member in archive.infolist()
+                if not member.is_dir()
+                and member.filename.lower().endswith(".zip")
+            ]
+
+            if not nested:
+                raise RuntimeError(
+                    f"ZIP does not contain CVE JSON records: {current.name}"
+                )
+
+            # Prefer the canonical payload produced by the baseline workflow.
+            nested.sort(
+                key=lambda member: (
+                    Path(member.filename).name.lower() != "cves.zip",
+                    member.filename,
+                )
+            )
+            member = nested[0]
+
+            if temp_dir is None:
+                temp_dir = tempfile.TemporaryDirectory(prefix="cvelistv5-")
+
+            inner_name = Path(member.filename).name
+            inner_path = Path(temp_dir.name) / f"nested-{depth}-{inner_name}"
+            print(f"Unwrapping nested CVE archive: {member.filename}")
+
+            with archive.open(member) as src, inner_path.open("wb") as dst:
+                shutil.copyfileobj(src, dst, length=1024 * 1024)
+
+        if not zipfile.is_zipfile(inner_path):
+            raise RuntimeError(
+                f"Nested archive is not a valid ZIP: {member.filename}"
+            )
+
+        current = inner_path
+
+    raise RuntimeError(
+        f"Too many nested ZIP layers while resolving {zip_path.name}"
+    )
+
+
 def iter_cve_records(zip_path: Path) -> Iterator[dict[str, Any]]:
     with zipfile.ZipFile(zip_path) as archive:
         for member in archive.infolist():
@@ -328,6 +407,8 @@ def find_latest_release_asset(release_type: str) -> dict[str, Any]:
     # Releases are returned newest first. A daily baseline should be within the
     # first page because the project publishes hourly releases. We still page
     # a few times so the script is resilient to unusual release activity.
+    seen_zip_assets: list[str] = []
+
     for page in range(1, 4):
         query = urllib.parse.urlencode({"per_page": 100, "page": page})
         releases = fetch_github_json(f"{GITHUB_RELEASES_API}?{query}")
@@ -346,6 +427,11 @@ def find_latest_release_asset(release_type: str) -> dict[str, Any]:
 
                 name = asset.get("name")
                 download_url = asset.get("browser_download_url")
+
+                if isinstance(name, str) and name.lower().endswith(".zip"):
+                    if len(seen_zip_assets) < 20:
+                        seen_zip_assets.append(name)
+
                 if (
                     isinstance(name, str)
                     and isinstance(download_url, str)
@@ -361,8 +447,10 @@ def find_latest_release_asset(release_type: str) -> dict[str, Any]:
         if len(releases) < 100:
             break
 
+    observed = ", ".join(dict.fromkeys(seen_zip_assets)) or "none"
     raise RuntimeError(
-        f"Could not find a recent cvelistV5 {release_type!r} ZIP asset."
+        f"Could not find a recent cvelistV5 {release_type!r} ZIP asset. "
+        f"Recent ZIP asset names observed: {observed}"
     )
 
 
@@ -410,7 +498,11 @@ def download_zip(url: str, filename: str) -> tuple[Path, tempfile.TemporaryDirec
         temp_dir.cleanup()
         raise RuntimeError(f"Downloaded file is not a valid ZIP: {filename}")
 
-    return target, temp_dir
+    try:
+        return prepare_cve_zip(target, temp_dir)
+    except Exception:
+        temp_dir.cleanup()
+        raise
 
 
 def obtain_zip(
@@ -435,11 +527,40 @@ def obtain_zip(
         raise FileNotFoundError(path)
     if not zipfile.is_zipfile(path):
         raise RuntimeError(f"Not a valid ZIP file: {path}")
-    return path, None
+    return prepare_cve_zip(path)
 
 
-def load_zip(zip_path: Path, database_url: str, batch_size: int) -> tuple[int, int]:
-    engine = create_engine(database_url, future=True)
+def normalize_database_url(database_url: str) -> str:
+    """Allow Neon's standard PostgreSQL URL to work with Psycopg 3.
+
+    Neon typically provides a URL beginning with ``postgresql://``. SQLAlchemy
+    uses the driver-qualified ``postgresql+psycopg://`` form to select Psycopg 3.
+    Query parameters such as ``sslmode=require`` and ``channel_binding=require``
+    are preserved unchanged.
+    """
+    if database_url.startswith("postgres://"):
+        return "postgresql+psycopg://" + database_url[len("postgres://"):]
+    if database_url.startswith("postgresql://"):
+        return "postgresql+psycopg://" + database_url[len("postgresql://"):]
+    return database_url
+
+
+def build_engine(database_url: str) -> Engine:
+    return create_engine(
+        normalize_database_url(database_url),
+        future=True,
+        pool_pre_ping=True,
+        pool_recycle=300,
+    )
+
+
+def verify_database_connection(engine: Engine) -> None:
+    with engine.connect() as connection:
+        connection.execute(text("SELECT 1"))
+    print("Database connection verified.")
+
+
+def load_zip(zip_path: Path, engine: Engine, batch_size: int) -> tuple[int, int]:
     Base.metadata.create_all(engine)
 
     processed = 0
@@ -472,6 +593,14 @@ def load_zip(zip_path: Path, database_url: str, batch_size: int) -> tuple[int, i
 
 
 def main() -> int:
+    # Load .env before reading any connection strings or secrets. Search from
+    # the current working directory so project-local .env files work even when
+    # this script is invoked by absolute path. Existing process environment
+    # variables take precedence over values in .env.
+    dotenv_path = find_dotenv(usecwd=True)
+    if dotenv_path:
+        load_dotenv(dotenv_path=dotenv_path, override=False)
+
     parser = argparse.ArgumentParser(
         description="Load a cvelistV5 release ZIP into a SQL database."
     )
@@ -495,14 +624,6 @@ def main() -> int:
         ),
     )
     parser.add_argument(
-        "--database-url",
-        default=os.getenv("DATABASE_URL", "sqlite:///cves.db"),
-        help=(
-            "SQLAlchemy database URL. Defaults to DATABASE_URL, "
-            "or sqlite:///cves.db if unset."
-        ),
-    )
-    parser.add_argument(
         "--batch-size",
         type=int,
         default=100,
@@ -514,10 +635,20 @@ def main() -> int:
     if args.batch_size < 1:
         parser.error("--batch-size must be >= 1")
 
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        parser.error(
+            "DATABASE_URL is not set. Add it to a .env file, for example: "
+            "DATABASE_URL=sqlite:///cves.db"
+        )
+
+    engine = build_engine(database_url)
+    verify_database_connection(engine)
+
     temp_dir = None
     try:
         zip_path, temp_dir = obtain_zip(args.zip_source, args.release_type)
-        loaded, skipped = load_zip(zip_path, args.database_url, args.batch_size)
+        loaded, skipped = load_zip(zip_path, engine, args.batch_size)
         print(f"Done. Upserted {loaded:,} CVEs; skipped {skipped:,} records.")
         return 0
     finally:

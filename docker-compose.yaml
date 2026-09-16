@@ -1,0 +1,8 @@
+services:
+  cve-loader:
+    build: .
+    env_file:
+      - .env
+    # Fresh/full sync. Override at runtime for a delta sync:
+    # docker compose run --rm cve-loader --release-type delta
+    command: ["--release-type", "baseline"]
